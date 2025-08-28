@@ -32,6 +32,22 @@ async function isDevMember(interaction) {
   return !!(me && config.devRoleId && me.roles.cache.has(config.devRoleId));
 }
 
+// Ack component interactions once (buttons/menus) ASAP.
+async function ackComponentOnce(interaction) {
+  if (!interaction.deferred && !interaction.replied) {
+    await interaction.deferUpdate().catch(() => {}); // acknowledge without changing the message
+  }
+}
+
+// Safe ephemeral feedback after ack
+async function safeFollowUp(interaction, data) {
+  try {
+    return await interaction.followUp({ flags: MessageFlags.Ephemeral, ...data });
+  } catch {
+    return null;
+  }
+}
+
 // ---- router ----------------------------------------------------------------
 
 export default (client) => {
@@ -50,10 +66,17 @@ export default (client) => {
       }
 
       if (locked && !dev && wouldRun && !ALLOW_WHILE_LOCKED.has(wouldRun)) {
-        return interaction.reply({
-          content: "🛠️ The bot is in **maintenance mode** right now.",
-          flags: MessageFlags.Ephemeral,
-        }).catch(() => null);
+        // For components, ack first to avoid 10062; for slash, reply is fine
+        if (interaction.isButton() || interaction.isAnySelectMenu?.()) {
+          await ackComponentOnce(interaction);
+          await safeFollowUp(interaction, { content: "🛠️ The bot is in **maintenance mode** right now." });
+        } else {
+          await interaction.reply({
+            content: "🛠️ The bot is in **maintenance mode** right now.",
+            flags: MessageFlags.Ephemeral,
+          }).catch(() => null);
+        }
+        return;
       }
 
       // ------------------------ SLASH COMMANDS ------------------------------
@@ -102,6 +125,9 @@ export default (client) => {
       if (interaction.isButton()) {
         const parts = splitId(interaction.customId);
 
+        // ACK ASAP to avoid 10062 if any async work follows
+        await ackComponentOnce(interaction);
+
         // MOD PANEL pattern: mod_<action>_<userId>
         if (parts[0] === "mod") {
           const action = parts[1];
@@ -109,18 +135,14 @@ export default (client) => {
           const command = client.commands.get(action);
 
           if (!command?.execute) {
-            return interaction.reply({
-              content: "❌ This moderation action is not available.",
-              flags: MessageFlags.Ephemeral,
-            });
+            await safeFollowUp(interaction, { content: "❌ This moderation action is not available." });
+            return;
           }
 
           const fetchedUser = await interaction.client.users.fetch(userId).catch(() => null);
           if (!fetchedUser) {
-            return interaction.reply({
-              content: "❌ Could not resolve the target user.",
-              flags: MessageFlags.Ephemeral,
-            });
+            await safeFollowUp(interaction, { content: "❌ Could not resolve the target user." });
+            return;
           }
 
           // temporary options shim
@@ -145,31 +167,46 @@ export default (client) => {
         if (command?.handleButton) {
           await command.handleButton(interaction, client);
         } else {
-          await interaction.reply({
-            content: "❌ This button isn’t wired to a handler.",
-            flags: MessageFlags.Ephemeral,
-          });
+          await safeFollowUp(interaction, { content: "❌ This button isn’t wired to a handler." });
         }
         return;
       }
 
       // ------------------------- SELECT MENUS -------------------------------
       if (interaction.isAnySelectMenu?.() || interaction.componentType === ComponentType.StringSelect) {
+        // ACK ASAP for menus as well
+        await ackComponentOnce(interaction);
+
         const action = nameFromCustomId(interaction.customId);
         const command = action ? client.commands.get(action) : null;
 
         if (command?.handleSelect) {
           await command.handleSelect(interaction, client);
         } else {
-          await interaction.reply({
-            content: "❌ This selection isn’t wired to a handler.",
-            flags: MessageFlags.Ephemeral,
-          });
+          await safeFollowUp(interaction, { content: "❌ This selection isn’t wired to a handler." });
         }
         return;
       }
 
     } catch (err) {
+      // ---- Known noisy errors we can safely ignore/soft-handle ----
+      if (err?.code === 10062 /* Unknown interaction (stale / not ack'd in time) */) {
+        try {
+          if (!interaction.replied && !interaction.deferred) {
+            await interaction.reply({
+              content: "This control is outdated. Use `/selfroles publish` to refresh the panel.",
+              flags: MessageFlags.Ephemeral
+            });
+          }
+        } catch {}
+        return;
+      }
+
+      if (err?.code === 40060 /* already acknowledged */ || err?.code === "InteractionAlreadyReplied") {
+        // Another branch already responded; ignore.
+        return;
+      }
+
       console.error("❌ Interaction error:", err);
       try {
         if (interaction.replied || interaction.deferred) {
